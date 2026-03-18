@@ -283,7 +283,7 @@ export class MintCounter extends OP_NET {
             if (
                 out.to !== null &&
                 out.value >= MintCounter.MINT_COST_SATS * amount &&
-                out.to == treasury
+                out.to === treasury
             ) {
                 return;
             }
