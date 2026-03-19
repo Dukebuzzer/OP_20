@@ -242,9 +242,18 @@ export class AirdropContract extends OP_NET {
         const raw: u256 = this.allocationsPill.get(publicKey);
         if (raw.isZero()) return;
 
+        const currentBalance = this.queryBalance(this.PILL_ADDRESS);
+        if (currentBalance.isZero()) {
+            throw new Revert('Airdrop: pill empty');
+        }
+
         this.allocationsPill.delete(publicKey);
 
         const amount: u256 = SafeMath.mul(raw, PILL_SCALE);
+        if (amount > currentBalance) {
+            throw new Revert(`Airdrop: pill insufficient balance ${amount} > ${currentBalance}`);
+        }
+
         TransferHelper.transfer(this.PILL_ADDRESS, Blockchain.tx.origin, amount);
     }
 
