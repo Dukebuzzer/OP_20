@@ -14,6 +14,7 @@ import {
     StoredBoolean,
     StoredU64,
     TransferHelper,
+    U256_BYTE_LENGTH,
 } from '@btc-vision/btc-runtime/runtime';
 import { u256 } from '@btc-vision/as-bignum/assembly';
 
@@ -74,6 +75,8 @@ export class AirdropContract extends OP_NET {
         this.blockData.set(1, closeMoto);
         this.blockData.set(2, closePill);
 
+        this.paused.value = true;
+
         this.blockData.save();
     }
 
@@ -115,6 +118,8 @@ export class AirdropContract extends OP_NET {
             throw new Revert('Airdrop: no allocation');
         }
 
+        this.holders.set(publicKey, u256.One);
+
         if (allocationPill && current <= closePill) {
             this.distributePill(publicKey);
         }
@@ -122,8 +127,6 @@ export class AirdropContract extends OP_NET {
         if (allocationMoto) {
             this.distributeMoto(publicKey);
         }
-
-        this.holders.set(publicKey, u256.One);
 
         const writer: BytesWriter = new BytesWriter(1);
         writer.writeBoolean(true);
@@ -168,6 +171,62 @@ export class AirdropContract extends OP_NET {
         return w;
     }
 
+    @method()
+    @returns(
+        {
+            name: 'canClaimPill',
+            type: ABIDataTypes.BOOL,
+        },
+        {
+            name: 'canClaimMoto',
+            type: ABIDataTypes.BOOL,
+        },
+        {
+            name: 'claimablePill',
+            type: ABIDataTypes.UINT256,
+        },
+        {
+            name: 'claimableMoto',
+            type: ABIDataTypes.UINT256,
+        },
+    )
+    @view()
+    public claimed(): BytesWriter {
+        const open: u64 = this.blockData.get(0);
+        const closeMoto: u64 = this.blockData.get(1);
+        const closePill: u64 = this.blockData.get(2);
+        const current: u64 = Blockchain.block.number;
+
+        if (current < open || current > closeMoto) {
+            throw new Revert('Airdrop: not active');
+        }
+
+        const publicKey = Address.fromUint8Array(Blockchain.tx.origin.tweakedPublicKey);
+        const redeemed: bool = this.holders.has(publicKey);
+        if (redeemed) {
+            throw new Revert('Airdrop: redeemed');
+        }
+
+        const redeemedValue = this.holders.get(publicKey);
+        if (redeemedValue === u256.One) {
+            throw new Revert('Airdrop: redeemed');
+        }
+
+        const allocationPill: bool = this.allocationsPill.has(publicKey);
+        const allocationMoto: bool = this.allocationsMoto.has(publicKey);
+        if (!allocationPill && !allocationMoto) {
+            throw new Revert('Airdrop: no allocation');
+        }
+
+        const writer: BytesWriter = new BytesWriter(2 + U256_BYTE_LENGTH * 2);
+        writer.writeBoolean(<boolean>(allocationPill && current <= closePill));
+        writer.writeBoolean(<boolean>allocationMoto);
+        writer.writeU256(SafeMath.mul(this.allocationsPill.get(publicKey), PILL_SCALE));
+        writer.writeU256(SafeMath.mul(this.allocationsMoto.get(publicKey), MOTO_SCALE));
+
+        return writer;
+    }
+
     @method(
         { name: 'addresses', type: ABIDataTypes.ARRAY_OF_ADDRESSES },
         { name: 'motoAmounts', type: ABIDataTypes.ARRAY_OF_UINT32 },
@@ -176,10 +235,6 @@ export class AirdropContract extends OP_NET {
     @returns({ name: 'success', type: ABIDataTypes.BOOL })
     public airdrop(calldata: Calldata): BytesWriter {
         this.onlyDeployer(Blockchain.tx.sender);
-
-        if (this.paused.value) {
-            throw new Revert('Airdrop: paused');
-        }
 
         const addresses: Address[] = calldata.readAddressArray();
         const motoAmounts: u32[] = calldata.readU32Array();
