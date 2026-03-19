@@ -23,7 +23,7 @@ MOTO_ADDRESS.set([]);
 const PILL_ADDRESS: Uint8Array = new Uint8Array(32);
 PILL_ADDRESS.set([]);
 
-const MOTO_SCALE: u256 = u256.fromString('1000000000000000000');
+const MOTO_SCALE: u256 = u256.fromString('10000000000000000');
 const PILL_SCALE: u256 = u256.fromString('1000000000000000000');
 
 @final
@@ -208,16 +208,16 @@ export class AirdropContract extends OP_NET {
     @method()
     @returns({ name: 'success', type: ABIDataTypes.BOOL })
     public withdraw(_calldata: Calldata): BytesWriter {
-        this.onlyDeployer(Blockchain.tx.sender);
+        this.onlyDeployer(Blockchain.tx.origin);
 
         const motoBalance: u256 = this.queryBalance(this.MOTO_ADDRESS);
         if (!motoBalance.isZero()) {
-            TransferHelper.transfer(this.MOTO_ADDRESS, Blockchain.tx.sender, motoBalance);
+            TransferHelper.transfer(this.MOTO_ADDRESS, Blockchain.tx.origin, motoBalance);
         }
 
         const pillBalance: u256 = this.queryBalance(this.PILL_ADDRESS);
         if (!pillBalance.isZero()) {
-            TransferHelper.transfer(this.PILL_ADDRESS, Blockchain.tx.sender, pillBalance);
+            TransferHelper.transfer(this.PILL_ADDRESS, Blockchain.tx.origin, pillBalance);
         }
 
         const writer: BytesWriter = new BytesWriter(1);
@@ -239,7 +239,7 @@ export class AirdropContract extends OP_NET {
         if (raw.isZero()) return;
 
         const amount: u256 = SafeMath.mul(raw, PILL_SCALE);
-        TransferHelper.transfer(this.PILL_ADDRESS, publicKey, amount);
+        TransferHelper.transfer(this.PILL_ADDRESS, Blockchain.tx.origin, amount);
     }
 
     private distributeMoto(publicKey: Address): void {
@@ -247,6 +247,6 @@ export class AirdropContract extends OP_NET {
         if (raw.isZero()) return;
 
         const amount: u256 = SafeMath.mul(raw, MOTO_SCALE);
-        TransferHelper.transfer(this.MOTO_ADDRESS, publicKey, amount);
+        TransferHelper.transfer(this.MOTO_ADDRESS, Blockchain.tx.origin, amount);
     }
 }
