@@ -191,7 +191,7 @@ export class AirdropContract extends OP_NET {
         },
     )
     @view()
-    public claimed(): BytesWriter {
+    public claimed(_calldata: Calldata): BytesWriter {
         const open: u64 = this.blockData.get(0);
         const closeMoto: u64 = this.blockData.get(1);
         const closePill: u64 = this.blockData.get(2);
