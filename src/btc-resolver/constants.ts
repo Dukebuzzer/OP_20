@@ -109,8 +109,8 @@ export const PREMIUM_TIER_3_PRICE_SATS: u64 = 15_000_000;
 /** Tier 4 - HIGH VALUE (0.05 BTC): 4-char domains + valuable keywords */
 export const PREMIUM_TIER_4_PRICE_SATS: u64 = 5_000_000;
 
-/** Tier 5 - STANDARD PREMIUM (0.01 BTC): 5-char domains + common keywords */
-export const PREMIUM_TIER_5_PRICE_SATS: u64 = 1_000_000;
+/** Tier 5 - STANDARD PREMIUM (0.0025 BTC): 5-char domains + common keywords */
+export const PREMIUM_TIER_5_PRICE_SATS: u64 = 250_000;
 
 // =============================================================================
 // Premium Domain Lists - TIER 0 (10 BTC - Ultra Legendary)
