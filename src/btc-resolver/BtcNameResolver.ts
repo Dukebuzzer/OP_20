@@ -68,6 +68,7 @@ import {
     MAX_TTL,
     MIN_DOMAIN_LENGTH,
     MIN_TTL,
+    PREMIUM_RENEWAL_MIN_SATS,
     PREMIUM_TIER_0_DOMAINS,
     PREMIUM_TIER_0_PRICE_SATS,
     PREMIUM_TIER_1_DOMAINS,
@@ -125,6 +126,8 @@ const domainReservationBlockPointer: u16 = Blockchain.nextPointer;
 const domainReservationYearsPointer: u16 = Blockchain.nextPointer;
 
 // Domain nonce (for signature replay protection)
+const domainPaidPriceSatsPointer: u16 = Blockchain.nextPointer;
+const domainPaidPriceMotoPointer: u16 = Blockchain.nextPointer;
 const domainGenerationPointer: u16 = Blockchain.nextPointer;
 const subdomainGenerationPointer: u16 = Blockchain.nextPointer;
 const domainNoncePointer: u16 = Blockchain.nextPointer;
@@ -184,6 +187,8 @@ export class BtcNameResolver extends OP_NET {
     // -------------------------------------------------------------------------
     // Domain Nonce (signature replay protection)
     // -------------------------------------------------------------------------
+    private readonly domainPaidPriceSats: StoredMapU256;
+    private readonly domainPaidPriceMoto: StoredMapU256;
     private readonly domainGeneration: StoredMapU256;
     private readonly subdomainGeneration: StoredMapU256;
     private readonly domainNonce: StoredMapU256;
@@ -233,6 +238,8 @@ export class BtcNameResolver extends OP_NET {
         this.domainReservationYears = new StoredMapU256(domainReservationYearsPointer);
 
         // Initialize nonce storage
+        this.domainPaidPriceSats = new StoredMapU256(domainPaidPriceSatsPointer);
+        this.domainPaidPriceMoto = new StoredMapU256(domainPaidPriceMotoPointer);
         this.domainGeneration = new StoredMapU256(domainGenerationPointer);
         this.subdomainGeneration = new StoredMapU256(subdomainGenerationPointer);
         this.domainNonce = new StoredMapU256(domainNoncePointer);
@@ -278,7 +285,7 @@ export class BtcNameResolver extends OP_NET {
         this.domainOwner.set(opnetDomainKey, this._addressToU256(deployer));
         this.domainCreated.set(opnetDomainKey, u256.fromU64(blockNumber));
         this.domainTTL.set(opnetDomainKey, u256.fromU64(DEFAULT_TTL));
-        this.domainExpiry.set(opnetDomainKey, u256.fromU64(u64.MAX_VALUE));
+        this.domainExpiry.set(opnetDomainKey, u256.fromU64(u64.MAX_VALUE - GRACE_PERIOD_BLOCKS));
 
         this.emitEvent(new DomainRegisteredEvent(opnetDomainKey, deployer, blockNumber));
     }
@@ -388,7 +395,12 @@ export class BtcNameResolver extends OP_NET {
         this.domainAuctionStart.set(domainKey, u256.Zero);
         this.contenthashType.set(domainKey, u256.Zero);
         this.contenthashData.set(domainKey, u256.Zero);
-        this.domainGeneration.set(domainKey, SafeMath.add(this.domainGeneration.get(domainKey), u256.One));
+        this.domainGeneration.set(
+            domainKey,
+            SafeMath.add(this.domainGeneration.get(domainKey), u256.One),
+        );
+        this.domainPaidPriceSats.set(domainKey, u256.fromU64(this.getPremiumTierPrice(domainName)));
+        this.domainPaidPriceMoto.set(domainKey, u256.Zero);
 
         this.emitEvent(new DomainRegisteredEvent(domainKey, owner, blockNumber));
 
@@ -415,8 +427,7 @@ export class BtcNameResolver extends OP_NET {
 
             if (years < 1 || years > MAX_REGISTRATION_YEARS) continue;
             if (owner.equals(Address.zero())) continue;
-            if (!this.isValidDomainName(domainName))
-                continue;
+            if (!this.isValidDomainName(domainName)) continue;
 
             const domainKey = this.getDomainKeyU256(domainName);
 
@@ -440,7 +451,15 @@ export class BtcNameResolver extends OP_NET {
             this.domainAuctionStart.set(domainKey, u256.Zero);
             this.contenthashType.set(domainKey, u256.Zero);
             this.contenthashData.set(domainKey, u256.Zero);
-            this.domainGeneration.set(domainKey, SafeMath.add(this.domainGeneration.get(domainKey), u256.One));
+            this.domainGeneration.set(
+                domainKey,
+                SafeMath.add(this.domainGeneration.get(domainKey), u256.One),
+            );
+            this.domainPaidPriceSats.set(
+                domainKey,
+                u256.fromU64(this.getPremiumTierPrice(domainName)),
+            );
+            this.domainPaidPriceMoto.set(domainKey, u256.Zero);
 
             this.emitEvent(new DomainRegisteredEvent(domainKey, owner, blockNumber));
             minted++;
@@ -672,13 +691,28 @@ export class BtcNameResolver extends OP_NET {
             this.domainPendingTimestamp.set(domainKey, u256.Zero);
         }
 
-        // Calculate MOTO price
-        const totalMotoPrice = this.calculateMotoRegistrationPrice(
+        const motoBase = this.motoBasePrice.get(u256.Zero);
+        if (motoBase.isZero()) {
+            throw new Revert('MOTO base price not set');
+        }
+        const motoAuctionPrice = this.getMotoFirstYearPrice(
             domainName,
             domainKey,
             blockNumber,
-            years,
+            motoBase,
         );
+
+        let totalMotoPrice: u256;
+        if (motoAuctionPrice > motoBase) {
+            const motoTenPercent = SafeMath.div(motoAuctionPrice, u256.fromU64(10));
+            const motoRenewalPerYear = motoTenPercent > motoBase ? motoTenPercent : motoBase;
+            totalMotoPrice = SafeMath.add(
+                motoAuctionPrice,
+                SafeMath.mul(motoRenewalPerYear, u256.fromU64(years)),
+            );
+        } else {
+            totalMotoPrice = SafeMath.mul(motoBase, u256.fromU64(years));
+        }
         this.collectMotoPayment(totalMotoPrice);
 
         // Register domain
@@ -694,9 +728,14 @@ export class BtcNameResolver extends OP_NET {
         // Clear stale auction start so next expiry cycle computes a fresh one
         this.domainAuctionStart.set(domainKey, u256.Zero);
 
-        // Clear stale contenthash from previous owner
         this.contenthashType.set(domainKey, u256.Zero);
         this.contenthashData.set(domainKey, u256.Zero);
+        this.domainGeneration.set(
+            domainKey,
+            SafeMath.add(this.domainGeneration.get(domainKey), u256.One),
+        );
+        this.domainPaidPriceSats.set(domainKey, u256.Zero);
+        this.domainPaidPriceMoto.set(domainKey, motoAuctionPrice);
 
         this.emitEvent(new DomainRegisteredEvent(domainKey, sender, blockNumber));
 
@@ -739,12 +778,19 @@ export class BtcNameResolver extends OP_NET {
             throw new Revert('Domain expired past grace period');
         }
 
-        // MOTO renewal: base price * years
         const motoBase = this.motoBasePrice.get(u256.Zero);
         if (motoBase.isZero()) {
             throw new Revert('MOTO base price not set');
         }
-        const totalMotoPrice = SafeMath.mul(motoBase, u256.fromU64(years));
+        const motoPaid = this.domainPaidPriceMoto.get(domainKey);
+        let totalMotoPrice: u256;
+        if (motoPaid > motoBase) {
+            const motoTenPercent = SafeMath.div(motoPaid, u256.fromU64(10));
+            const motoRenewalPerYear = motoTenPercent > motoBase ? motoTenPercent : motoBase;
+            totalMotoPrice = SafeMath.mul(motoRenewalPerYear, u256.fromU64(years));
+        } else {
+            totalMotoPrice = SafeMath.mul(motoBase, u256.fromU64(years));
+        }
         this.collectMotoPayment(totalMotoPrice);
 
         const extensionBase = blockNumber > currentExpiry ? blockNumber : currentExpiry;
@@ -877,10 +923,16 @@ export class BtcNameResolver extends OP_NET {
             this.domainPendingTimestamp.set(domainKey, u256.Zero);
         }
 
-        // Calculate price and deduct reservation fee
         const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
         const auctionPrice = this.calculateAuctionPrice(domainName, domainKey, blockNumber);
-        const totalPrice = SafeMath.add64(auctionPrice, SafeMath.mul64(basePrice, years - 1));
+
+        let totalPrice: u64;
+        if (auctionPrice > basePrice) {
+            const renewalPerYear = this.getPremiumRenewalSats(auctionPrice);
+            totalPrice = SafeMath.add64(auctionPrice, SafeMath.mul64(renewalPerYear, years));
+        } else {
+            totalPrice = SafeMath.mul64(basePrice, years);
+        }
         const remainingPrice =
             totalPrice > RESERVATION_FEE_SATS
                 ? SafeMath.sub64(totalPrice, RESERVATION_FEE_SATS)
@@ -903,7 +955,12 @@ export class BtcNameResolver extends OP_NET {
 
         this.contenthashType.set(domainKey, u256.Zero);
         this.contenthashData.set(domainKey, u256.Zero);
-        this.domainGeneration.set(domainKey, SafeMath.add(this.domainGeneration.get(domainKey), u256.One));
+        this.domainGeneration.set(
+            domainKey,
+            SafeMath.add(this.domainGeneration.get(domainKey), u256.One),
+        );
+        this.domainPaidPriceSats.set(domainKey, u256.fromU64(auctionPrice));
+        this.domainPaidPriceMoto.set(domainKey, u256.Zero);
 
         // Clear reservation
         this.domainReservationOwner.set(domainKey, u256.Zero);
@@ -955,9 +1012,15 @@ export class BtcNameResolver extends OP_NET {
             throw new Revert('Domain expired past grace period');
         }
 
-        // Calculate payment: base price * years (no premium on renewals)
         const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
-        const totalPrice = SafeMath.mul64(basePrice, years);
+        const paidPrice = this.domainPaidPriceSats.get(domainKey).toU64();
+
+        let totalPrice: u64;
+        if (paidPrice > basePrice) {
+            totalPrice = SafeMath.mul64(this.getPremiumRenewalSats(paidPrice), years);
+        } else {
+            totalPrice = SafeMath.mul64(basePrice, years);
+        }
         this.verifyPayment(totalPrice);
 
         // Extend expiry from max(currentBlock, currentExpiry)
@@ -1293,9 +1356,12 @@ export class BtcNameResolver extends OP_NET {
 
         const subdomainKey = this.getSubdomainKeyU256(fullName);
 
-        // Check if subdomain already exists
         if (!this.subdomainExists.get(subdomainKey).isZero()) {
-            throw new Revert('Subdomain already exists');
+            const currentGen = this.domainGeneration.get(parentKey);
+            const subGen = this.subdomainGeneration.get(subdomainKey);
+            if (currentGen == subGen) {
+                throw new Revert('Subdomain already exists');
+            }
         }
 
         // Determine owner (default to caller if zero address)
@@ -1768,26 +1834,35 @@ export class BtcNameResolver extends OP_NET {
     @returns(
         { name: 'totalPriceSats', type: ABIDataTypes.UINT64 },
         { name: 'auctionPriceSats', type: ABIDataTypes.UINT64 },
-        { name: 'basePricePerYear', type: ABIDataTypes.UINT64 },
+        { name: 'renewalPerYear', type: ABIDataTypes.UINT64 },
     )
     public getDomainPrice(calldata: Calldata): BytesWriter {
         const domainName = calldata.readStringWithLength();
         const years = calldata.readU64();
+
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
+        }
 
         const domainKey = this.getDomainKeyU256(domainName);
         const blockNumber = Blockchain.block.number;
         const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
         const auctionPrice = this.calculateAuctionPrice(domainName, domainKey, blockNumber);
 
-        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
-            throw new Revert('Years must be 1-10');
+        let totalPrice: u64;
+        let renewalPerYear: u64;
+        if (auctionPrice > basePrice) {
+            renewalPerYear = this.getPremiumRenewalSats(auctionPrice);
+            totalPrice = SafeMath.add64(auctionPrice, SafeMath.mul64(renewalPerYear, years));
+        } else {
+            renewalPerYear = basePrice;
+            totalPrice = SafeMath.mul64(basePrice, years);
         }
-        const totalPrice = SafeMath.add64(auctionPrice, SafeMath.mul64(basePrice, years - 1));
 
         const response = new BytesWriter(8 + 8 + 8);
         response.writeU64(totalPrice);
         response.writeU64(auctionPrice);
-        response.writeU64(basePrice);
+        response.writeU64(renewalPerYear);
 
         return response;
     }
@@ -1932,7 +2007,8 @@ export class BtcNameResolver extends OP_NET {
         if (!this.isAlphanumeric(domain.charCodeAt(len - 1))) return false;
         for (let i = 0; i < len; i++) {
             const c = domain.charCodeAt(i);
-            if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45)) return false;
+            if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45))
+                return false;
         }
         for (let i = 0; i < len - 1; i++) {
             if (domain.charCodeAt(i) == 45 && domain.charCodeAt(i + 1) == 45) return false;
@@ -2195,6 +2271,12 @@ export class BtcNameResolver extends OP_NET {
      * - If domain existed before: expiry + grace period
      * - Otherwise: deployment block
      */
+    /** Returns max(price * 10%, PREMIUM_RENEWAL_MIN_SATS) */
+    private getPremiumRenewalSats(price: u64): u64 {
+        const tenPercent = SafeMath.div64(price, 10);
+        return tenPercent > PREMIUM_RENEWAL_MIN_SATS ? tenPercent : PREMIUM_RENEWAL_MIN_SATS;
+    }
+
     private getAuctionStart(domainKey: u256): u64 {
         const storedAuctionStart = this.domainAuctionStart.get(domainKey).toU64();
         if (storedAuctionStart > 0) {
@@ -2364,44 +2446,22 @@ export class BtcNameResolver extends OP_NET {
      * Calculate total MOTO cost for domain registration.
      * Premium tier MOTO price (with Dutch auction decay) + base MOTO price for extra years.
      */
-    private calculateMotoRegistrationPrice(
+    /** Returns the first-year MOTO price (auction or base) for a domain. */
+    private getMotoFirstYearPrice(
         domainName: string,
         domainKey: u256,
         currentBlock: u64,
-        years: u64,
+        motoBase: u256,
     ): u256 {
-        const motoBase = this.motoBasePrice.get(u256.Zero);
-        if (motoBase.isZero()) {
-            throw new Revert('MOTO base price not set');
-        }
-
         const tierIndex = this.getDomainTierIndex(domainName);
-
-        // Non-premium: just base * years
         if (tierIndex == 255) {
-            return SafeMath.mul(motoBase, u256.fromU64(years));
+            return motoBase;
         }
-
-        // Premium: get MOTO tier price and apply Dutch auction decay
         const motoTierPrice = this.motoTierPrices.get(u256.fromU32(<u32>tierIndex));
         if (motoTierPrice.isZero()) {
             throw new Revert('MOTO tier price not set');
         }
-
-        // Dutch auction on MOTO price: decay from motoTierPrice to motoBase
-        const auctionPrice = this.calculateMotoAuctionPrice(
-            motoTierPrice,
-            motoBase,
-            domainKey,
-            currentBlock,
-        );
-
-        // Auction covers first year, base for remaining
-        if (years <= 1) {
-            return auctionPrice;
-        }
-
-        return SafeMath.add(auctionPrice, SafeMath.mul(motoBase, u256.fromU64(years - 1)));
+        return this.calculateMotoAuctionPrice(motoTierPrice, motoBase, domainKey, currentBlock);
     }
 
     /**
