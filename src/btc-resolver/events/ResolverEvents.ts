@@ -106,6 +106,50 @@ export class DomainTransferCancelledEvent extends NetEvent {
     }
 }
 
+/**
+ * Emitted when a domain is reserved for registration.
+ * @param domainHash - SHA256 hash of the domain name
+ * @param reserver - Address of the reserver
+ * @param years - Number of years requested
+ * @param timestamp - Block number when reserved
+ */
+@final
+export class DomainReservedEvent extends NetEvent {
+    constructor(domainHash: u256, reserver: Address, years: u64, timestamp: u64) {
+        const data: BytesWriter = new BytesWriter(
+            U256_BYTE_LENGTH + ADDRESS_BYTE_LENGTH + U64_BYTE_LENGTH * 2,
+        );
+        data.writeU256(domainHash);
+        data.writeAddress(reserver);
+        data.writeU64(years);
+        data.writeU64(timestamp);
+
+        super('DomainReserved', data);
+    }
+}
+
+/**
+ * Emitted when a domain is renewed.
+ * @param domainHash - SHA256 hash of the domain name
+ * @param owner - Address of the domain owner
+ * @param newExpiry - New expiry block number
+ * @param timestamp - Block number when renewed
+ */
+@final
+export class DomainRenewedEvent extends NetEvent {
+    constructor(domainHash: u256, owner: Address, newExpiry: u64, timestamp: u64) {
+        const data: BytesWriter = new BytesWriter(
+            U256_BYTE_LENGTH + ADDRESS_BYTE_LENGTH + U64_BYTE_LENGTH * 2,
+        );
+        data.writeU256(domainHash);
+        data.writeAddress(owner);
+        data.writeU64(newExpiry);
+        data.writeU64(timestamp);
+
+        super('DomainRenewed', data);
+    }
+}
+
 // =============================================================================
 // Subdomain Events
 // =============================================================================
@@ -251,5 +295,19 @@ export class TreasuryChangedEvent extends NetEvent {
         data.writeU64(timestamp);
 
         super('TreasuryChanged', data);
+    }
+}
+
+/**
+ * Emitted when contract bytecode is updated.
+ * @param address - Address of the source contract containing the new bytecode
+ */
+@final
+export class ContractUpdatedEvent extends NetEvent {
+    constructor(address: Address) {
+        const data: BytesWriter = new BytesWriter(ADDRESS_BYTE_LENGTH);
+        data.writeAddress(address);
+
+        super('ContractUpdated', data);
     }
 }

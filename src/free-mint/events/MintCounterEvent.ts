@@ -1,10 +1,4 @@
-import {
-    Address,
-    ADDRESS_BYTE_LENGTH,
-    BytesWriter,
-    NetEvent,
-    U64_BYTE_LENGTH,
-} from '@btc-vision/btc-runtime/runtime';
+import { Address, ADDRESS_BYTE_LENGTH, BytesWriter, NetEvent, U64_BYTE_LENGTH, } from '@btc-vision/btc-runtime/runtime';
 
 @final
 export class MintCounterEvent extends NetEvent {

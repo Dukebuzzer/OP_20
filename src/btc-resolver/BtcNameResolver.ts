@@ -19,21 +19,28 @@ import {
     BytesWriter,
     Calldata,
     ExtendedAddress,
+    ON_OP20_RECEIVED_SELECTOR,
     OP_NET,
+    OP20Utils,
     Revert,
     SafeMath,
     StoredString,
+    TransferHelper,
     U256_BYTE_LENGTH,
     U64_BYTE_LENGTH,
 } from '@btc-vision/btc-runtime/runtime';
+import { SELECTOR_BYTE_LENGTH } from '@btc-vision/btc-runtime/runtime/utils/lengths';
 import { StoredMapU256 } from '@btc-vision/btc-runtime/runtime/storage/maps/StoredMapU256';
 import { AdvancedStoredString } from '@btc-vision/btc-runtime/runtime/storage/AdvancedStoredString';
 
 import {
+    ContractUpdatedEvent,
     ContenthashChangedEvent,
     ContenthashClearedEvent,
     DomainPriceChangedEvent,
     DomainRegisteredEvent,
+    DomainRenewedEvent,
+    DomainReservedEvent,
     DomainTransferCancelledEvent,
     DomainTransferCompletedEvent,
     DomainTransferInitiatedEvent,
@@ -44,15 +51,19 @@ import {
 } from './events/ResolverEvents';
 
 import {
+    AUCTION_DURATION_BLOCKS,
+    BLOCKS_PER_YEAR,
     CONTENTHASH_TYPE_CIDv0,
     CONTENTHASH_TYPE_CIDv1,
     CONTENTHASH_TYPE_IPNS,
     CONTENTHASH_TYPE_SHA256,
     DEFAULT_DOMAIN_PRICE_SATS,
     DEFAULT_TTL,
+    GRACE_PERIOD_BLOCKS,
     MAX_CONTENTHASH_LENGTH,
     MAX_DOMAIN_LENGTH,
     MAX_FULL_NAME_LENGTH,
+    MAX_REGISTRATION_YEARS,
     MAX_SUBDOMAIN_LENGTH,
     MAX_TTL,
     MIN_DOMAIN_LENGTH,
@@ -70,6 +81,9 @@ import {
     PREMIUM_TIER_5_DOMAINS,
     PREMIUM_TIER_5_PRICE_SATS,
     PREMIUM_TIER_6_DOMAINS,
+    RESERVATION_FEE_ADDRESS,
+    RESERVATION_FEE_SATS,
+    RESERVATION_TIMEOUT_BLOCKS,
     RESERVED_DOMAIN,
 } from './constants';
 
@@ -80,12 +94,15 @@ import {
 // Contract-level settings
 const treasuryAddressPointer: u16 = Blockchain.nextPointer;
 const domainPriceSatsPointer: u16 = Blockchain.nextPointer;
+const deploymentBlockPointer: u16 = Blockchain.nextPointer;
 
 // Domain storage
 const domainExistsPointer: u16 = Blockchain.nextPointer;
 const domainOwnerPointer: u16 = Blockchain.nextPointer;
 const domainCreatedPointer: u16 = Blockchain.nextPointer;
 const domainTTLPointer: u16 = Blockchain.nextPointer;
+const domainExpiryPointer: u16 = Blockchain.nextPointer;
+const domainAuctionStartPointer: u16 = Blockchain.nextPointer;
 
 // Domain transfer tracking
 const domainPendingOwnerPointer: u16 = Blockchain.nextPointer;
@@ -102,6 +119,20 @@ const contenthashTypePointer: u16 = Blockchain.nextPointer;
 const contenthashDataPointer: u16 = Blockchain.nextPointer;
 const contenthashStringPointer: u16 = Blockchain.nextPointer;
 
+// Reservation storage
+const domainReservationOwnerPointer: u16 = Blockchain.nextPointer;
+const domainReservationBlockPointer: u16 = Blockchain.nextPointer;
+const domainReservationYearsPointer: u16 = Blockchain.nextPointer;
+
+// Domain nonce (for signature replay protection)
+const domainNoncePointer: u16 = Blockchain.nextPointer;
+
+// MOTO OP20 payment storage
+const motoTokenAddressPointer: u16 = Blockchain.nextPointer;
+const motoTierPricesPointer: u16 = Blockchain.nextPointer;
+const motoBasePricePointer: u16 = Blockchain.nextPointer;
+const motoEnabledPointer: u16 = Blockchain.nextPointer;
+
 // =============================================================================
 // Contract Implementation
 // =============================================================================
@@ -113,6 +144,7 @@ export class BtcNameResolver extends OP_NET {
     // -------------------------------------------------------------------------
     private readonly treasuryAddress: StoredString;
     private readonly domainPriceSats: StoredMapU256;
+    private readonly deploymentBlock: StoredMapU256;
 
     // -------------------------------------------------------------------------
     // Domain Storage Maps
@@ -121,6 +153,8 @@ export class BtcNameResolver extends OP_NET {
     private readonly domainOwner: StoredMapU256;
     private readonly domainCreated: StoredMapU256;
     private readonly domainTTL: StoredMapU256;
+    private readonly domainExpiry: StoredMapU256;
+    private readonly domainAuctionStart: StoredMapU256;
     private readonly domainPendingOwner: StoredMapU256;
     private readonly domainPendingTimestamp: StoredMapU256;
 
@@ -139,6 +173,26 @@ export class BtcNameResolver extends OP_NET {
     private readonly contenthashData: StoredMapU256;
 
     // -------------------------------------------------------------------------
+    // Reservation Storage
+    // -------------------------------------------------------------------------
+    private readonly domainReservationOwner: StoredMapU256;
+    private readonly domainReservationBlock: StoredMapU256;
+    private readonly domainReservationYears: StoredMapU256;
+
+    // -------------------------------------------------------------------------
+    // Domain Nonce (signature replay protection)
+    // -------------------------------------------------------------------------
+    private readonly domainNonce: StoredMapU256;
+
+    // -------------------------------------------------------------------------
+    // MOTO OP20 Payment Storage
+    // -------------------------------------------------------------------------
+    private readonly motoTokenAddress: StoredMapU256;
+    private readonly motoTierPrices: StoredMapU256;
+    private readonly motoBasePrice: StoredMapU256;
+    private readonly motoEnabled: StoredMapU256;
+
+    // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
     public constructor() {
@@ -147,12 +201,15 @@ export class BtcNameResolver extends OP_NET {
         // Initialize settings storage
         this.treasuryAddress = new StoredString(treasuryAddressPointer);
         this.domainPriceSats = new StoredMapU256(domainPriceSatsPointer);
+        this.deploymentBlock = new StoredMapU256(deploymentBlockPointer);
 
         // Initialize domain storage
         this.domainExists = new StoredMapU256(domainExistsPointer);
         this.domainOwner = new StoredMapU256(domainOwnerPointer);
         this.domainCreated = new StoredMapU256(domainCreatedPointer);
         this.domainTTL = new StoredMapU256(domainTTLPointer);
+        this.domainExpiry = new StoredMapU256(domainExpiryPointer);
+        this.domainAuctionStart = new StoredMapU256(domainAuctionStartPointer);
         this.domainPendingOwner = new StoredMapU256(domainPendingOwnerPointer);
         this.domainPendingTimestamp = new StoredMapU256(domainPendingTimestampPointer);
 
@@ -165,6 +222,27 @@ export class BtcNameResolver extends OP_NET {
         // Initialize contenthash storage
         this.contenthashType = new StoredMapU256(contenthashTypePointer);
         this.contenthashData = new StoredMapU256(contenthashDataPointer);
+
+        // Initialize reservation storage
+        this.domainReservationOwner = new StoredMapU256(domainReservationOwnerPointer);
+        this.domainReservationBlock = new StoredMapU256(domainReservationBlockPointer);
+        this.domainReservationYears = new StoredMapU256(domainReservationYearsPointer);
+
+        // Initialize nonce storage
+        this.domainNonce = new StoredMapU256(domainNoncePointer);
+
+        // Initialize MOTO payment storage
+        this.motoTokenAddress = new StoredMapU256(motoTokenAddressPointer);
+        this.motoTierPrices = new StoredMapU256(motoTierPricesPointer);
+        this.motoBasePrice = new StoredMapU256(motoBasePricePointer);
+        this.motoEnabled = new StoredMapU256(motoEnabledPointer);
+    }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+    public override onUpdate(calldata: Calldata): void {
+        super.onUpdate(calldata);
     }
 
     // -------------------------------------------------------------------------
@@ -182,15 +260,19 @@ export class BtcNameResolver extends OP_NET {
         // Set default price
         this.domainPriceSats.set(u256.Zero, u256.fromU64(DEFAULT_DOMAIN_PRICE_SATS));
 
-        // Reserve 'opnet.btc' for deployer
-        const opnetDomainKey = this.getDomainKeyU256(RESERVED_DOMAIN);
+        // Store deployment block as default auction start for never-registered domains
         const blockNumber = Blockchain.block.number;
+        this.deploymentBlock.set(u256.Zero, u256.fromU64(blockNumber));
+
+        // Reserve 'opnet.btc' for deployer (never expires)
+        const opnetDomainKey = this.getDomainKeyU256(RESERVED_DOMAIN);
         const deployer = Blockchain.tx.origin;
 
         this.domainExists.set(opnetDomainKey, u256.One);
         this.domainOwner.set(opnetDomainKey, this._addressToU256(deployer));
         this.domainCreated.set(opnetDomainKey, u256.fromU64(blockNumber));
         this.domainTTL.set(opnetDomainKey, u256.fromU64(DEFAULT_TTL));
+        this.domainExpiry.set(opnetDomainKey, u256.fromU64(u64.MAX_VALUE));
 
         this.emitEvent(new DomainRegisteredEvent(opnetDomainKey, deployer, blockNumber));
     }
@@ -235,6 +317,10 @@ export class BtcNameResolver extends OP_NET {
         this.onlyDeployer(Blockchain.tx.sender);
 
         const newPrice = calldata.readU64();
+        if (newPrice == 0) {
+            throw new Revert('Price cannot be zero');
+        }
+
         const oldPrice = this.domainPriceSats.get(u256.Zero).toU64();
 
         this.domainPriceSats.set(u256.Zero, u256.fromU64(newPrice));
@@ -244,48 +330,630 @@ export class BtcNameResolver extends OP_NET {
         return new BytesWriter(0);
     }
 
+    /**
+     * Mint any domain for free. Deployer only.
+     * Bypasses payment, auction, and reservation. Respects expiry and availability.
+     */
+    @method(
+        { name: 'domainName', type: ABIDataTypes.STRING },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+        { name: 'owner', type: ABIDataTypes.ADDRESS },
+    )
+    @emit('DomainRegistered')
+    public mintDomain(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const domainName = calldata.readStringWithLength();
+        const years = calldata.readU64();
+        const owner = calldata.readAddress();
+
+        this.validateDomainName(domainName);
+
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
+        }
+
+        if (owner.equals(Address.zero())) {
+            throw new Revert('Invalid owner');
+        }
+
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        // Check availability
+        const exists = !this.domainExists.get(domainKey).isZero();
+        if (exists) {
+            const expiry = this.domainExpiry.get(domainKey).toU64();
+            const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+            if (blockNumber <= graceEnd) {
+                throw new Revert('Domain is not available');
+            }
+            this.domainPendingOwner.set(domainKey, u256.Zero);
+            this.domainPendingTimestamp.set(domainKey, u256.Zero);
+        }
+
+        const expiryBlock = SafeMath.add64(blockNumber, SafeMath.mul64(BLOCKS_PER_YEAR, years));
+
+        this.domainExists.set(domainKey, u256.One);
+        this.domainOwner.set(domainKey, this._addressToU256(owner));
+        this.domainCreated.set(domainKey, u256.fromU64(blockNumber));
+        this.domainTTL.set(domainKey, u256.fromU64(DEFAULT_TTL));
+        this.domainExpiry.set(domainKey, u256.fromU64(expiryBlock));
+        this.domainAuctionStart.set(domainKey, u256.Zero);
+        this.contenthashType.set(domainKey, u256.Zero);
+        this.contenthashData.set(domainKey, u256.Zero);
+
+        this.emitEvent(new DomainRegisteredEvent(domainKey, owner, blockNumber));
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Airdrop domains to multiple addresses. Deployer only.
+     * Takes an array of (domainName, years, owner) tuples.
+     * Skips unavailable domains instead of reverting the whole batch.
+     */
+    @method({ name: 'entries', type: 'tuple(string,uint64,address)[]' })
+    public airdropDomains(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const count = calldata.readU16();
+        const blockNumber = Blockchain.block.number;
+        let minted: u16 = 0;
+
+        for (let i: u16 = 0; i < count; i++) {
+            const domainName = calldata.readStringWithLength();
+            const years = calldata.readU64();
+            const owner = calldata.readAddress();
+
+            // Skip invalid entries
+            if (years < 1 || years > MAX_REGISTRATION_YEARS) continue;
+            if (owner.equals(Address.zero())) continue;
+            if (<u32>domainName.length < MIN_DOMAIN_LENGTH || <u32>domainName.length > MAX_DOMAIN_LENGTH) continue;
+
+            const domainKey = this.getDomainKeyU256(domainName);
+
+            // Skip if domain is active or in grace
+            const exists = !this.domainExists.get(domainKey).isZero();
+            if (exists) {
+                const expiry = this.domainExpiry.get(domainKey).toU64();
+                const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+                if (blockNumber <= graceEnd) continue;
+                this.domainPendingOwner.set(domainKey, u256.Zero);
+                this.domainPendingTimestamp.set(domainKey, u256.Zero);
+            }
+
+            const expiryBlock = SafeMath.add64(blockNumber, SafeMath.mul64(BLOCKS_PER_YEAR, years));
+
+            this.domainExists.set(domainKey, u256.One);
+            this.domainOwner.set(domainKey, this._addressToU256(owner));
+            this.domainCreated.set(domainKey, u256.fromU64(blockNumber));
+            this.domainTTL.set(domainKey, u256.fromU64(DEFAULT_TTL));
+            this.domainExpiry.set(domainKey, u256.fromU64(expiryBlock));
+            this.domainAuctionStart.set(domainKey, u256.Zero);
+            this.contenthashType.set(domainKey, u256.Zero);
+            this.contenthashData.set(domainKey, u256.Zero);
+
+            this.emitEvent(new DomainRegisteredEvent(domainKey, owner, blockNumber));
+            minted++;
+        }
+
+        const response = new BytesWriter(2);
+        response.writeU16(minted);
+        return response;
+    }
+
     // =========================================================================
-    // DOMAIN REGISTRATION METHODS
+    // CONTRACT UPDATE
     // =========================================================================
 
     /**
-     * Register a new .btc domain.
-     * @param calldata Contains domain name (without .btc suffix)
+     * Update contract bytecode. Deployer only, EOA only.
      */
-    @method({ name: 'domainName', type: ABIDataTypes.STRING })
-    @emit('DomainRegistered')
-    public registerDomain(calldata: Calldata): BytesWriter {
-        const domainName = calldata.readStringWithLength();
+    @method(
+        { name: 'sourceAddress', type: ABIDataTypes.ADDRESS },
+        { name: 'updateCalldata', type: ABIDataTypes.BYTES },
+    )
+    @emit('ContractUpdated')
+    public update(calldata: Calldata): BytesWriter {
+        if (Blockchain.tx.sender !== Blockchain.tx.origin) {
+            throw new Revert('Origin must be the sender');
+        }
 
-        // Validate domain name
+        if (Blockchain.isContract(Blockchain.tx.sender)) {
+            throw new Revert('Sender must be EOA');
+        }
+
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const address: Address = calldata.readAddress();
+        const data: Uint8Array = calldata.readBytesWithLength();
+
+        const writer = new BytesWriter(data.length);
+        writer.writeBytes(data);
+
+        Blockchain.updateContractFromExisting(address, writer);
+        Blockchain.emit(new ContractUpdatedEvent(address));
+
+        return new BytesWriter(0);
+    }
+
+    // =========================================================================
+    // OP20 TOKEN METHODS
+    // =========================================================================
+
+    /**
+     * OP20 safe transfer callback. Required to receive MOTO tokens.
+     */
+    @method(
+        { name: 'operator', type: ABIDataTypes.ADDRESS },
+        { name: 'from', type: ABIDataTypes.ADDRESS },
+        { name: 'amount', type: ABIDataTypes.UINT256 },
+        { name: 'data', type: ABIDataTypes.BYTES },
+    )
+    @returns({ name: 'selector', type: ABIDataTypes.BYTES4 })
+    public onOP20Received(_calldata: Calldata): BytesWriter {
+        const writer = new BytesWriter(SELECTOR_BYTE_LENGTH);
+        writer.writeSelector(ON_OP20_RECEIVED_SELECTOR);
+        return writer;
+    }
+
+    /**
+     * Set the MOTO token contract address. Deployer only.
+     */
+    @method({ name: 'tokenAddress', type: ABIDataTypes.ADDRESS })
+    public setMotoTokenAddress(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const tokenAddress = calldata.readAddress();
+        this.motoTokenAddress.set(u256.Zero, this._addressToU256(tokenAddress));
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Set MOTO price for a specific premium tier. Deployer only.
+     * Tier 0-5 maps to premium tiers, tier 255 is the base/default price.
+     */
+    @method(
+        { name: 'tier', type: ABIDataTypes.UINT8 },
+        { name: 'price', type: ABIDataTypes.UINT256 },
+    )
+    public setMotoTierPrice(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const tier = calldata.readU8();
+        const price = calldata.readU256();
+
+        this.motoTierPrices.set(u256.fromU32(<u32>tier), price);
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Set MOTO base price for non-premium domains (per year). Deployer only.
+     */
+    @method({ name: 'price', type: ABIDataTypes.UINT256 })
+    public setMotoBasePrice(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const price = calldata.readU256();
+        if (price.isZero()) {
+            throw new Revert('Price cannot be zero');
+        }
+        this.motoBasePrice.set(u256.Zero, price);
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Enable or disable MOTO payments. Deployer only. Disabled by default.
+     */
+    @method({ name: 'enabled', type: ABIDataTypes.BOOL })
+    public setMotoEnabled(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const enabled = calldata.readBoolean();
+        this.motoEnabled.set(u256.Zero, enabled ? u256.One : u256.Zero);
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Get MOTO price for a specific premium tier.
+     */
+    @method({ name: 'tier', type: ABIDataTypes.UINT8 })
+    @returns({ name: 'price', type: ABIDataTypes.UINT256 })
+    public getMotoTierPrice(calldata: Calldata): BytesWriter {
+        const tier = calldata.readU8();
+        const price = this.motoTierPrices.get(u256.fromU32(<u32>tier));
+
+        const response = new BytesWriter(32);
+        response.writeU256(price);
+        return response;
+    }
+
+    /**
+     * Get MOTO base price per year.
+     */
+    @method()
+    @returns({ name: 'price', type: ABIDataTypes.UINT256 })
+    public getMotoBasePriceView(_calldata: Calldata): BytesWriter {
+        const price = this.motoBasePrice.get(u256.Zero);
+
+        const response = new BytesWriter(32);
+        response.writeU256(price);
+        return response;
+    }
+
+    /**
+     * Get the MOTO token contract address.
+     */
+    @method()
+    @returns({ name: 'tokenAddress', type: ABIDataTypes.ADDRESS })
+    public getMotoTokenAddressView(_calldata: Calldata): BytesWriter {
+        const addr = this._u256ToAddress(this.motoTokenAddress.get(u256.Zero));
+
+        const response = new BytesWriter(ADDRESS_BYTE_LENGTH);
+        response.writeAddress(addr);
+        return response;
+    }
+
+    /**
+     * Withdraw OP20 tokens held by this contract. Deployer only.
+     */
+    @method({ name: 'token', type: ABIDataTypes.ADDRESS })
+    @returns({ name: 'success', type: ABIDataTypes.BOOL })
+    public withdrawOP20(calldata: Calldata): BytesWriter {
+        this.onlyDeployer(Blockchain.tx.sender);
+
+        const token = calldata.readAddress();
+        const balance = OP20Utils.balanceOf(token, Blockchain.contractAddress);
+
+        if (!balance.isZero()) {
+            TransferHelper.transfer(token, Blockchain.tx.sender, balance);
+        }
+
+        const response = new BytesWriter(1);
+        response.writeBoolean(true);
+        return response;
+    }
+
+    // =========================================================================
+    // MOTO DOMAIN REGISTRATION & RENEWAL
+    // =========================================================================
+
+    /**
+     * Register a domain paying with MOTO tokens instead of BTC.
+     * Caller must have approved this contract to spend their MOTO tokens.
+     */
+    @method(
+        { name: 'domainName', type: ABIDataTypes.STRING },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+    )
+    @emit('DomainRegistered')
+    public registerDomainWithMoto(calldata: Calldata): BytesWriter {
+        this.requireEOA();
+        this.requireMotoEnabled();
+
+        const domainName = calldata.readStringWithLength();
+        const years = calldata.readU64();
+
         this.validateDomainName(domainName);
 
-        // Check if reserved
         if (domainName == RESERVED_DOMAIN) {
             throw new Revert('Domain is reserved');
         }
 
-        const domainKey = this.getDomainKeyU256(domainName);
-
-        // Check if already exists
-        if (!this.domainExists.get(domainKey).isZero()) {
-            throw new Revert('Domain already exists');
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
         }
 
-        // Calculate and verify payment (premium pricing for short domains)
-        const price = this.calculateDomainPrice(domainName);
-        this.verifyPayment(price);
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        // Check domain availability
+        const exists = !this.domainExists.get(domainKey).isZero();
+        if (exists) {
+            const expiry = this.domainExpiry.get(domainKey).toU64();
+            const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+            if (blockNumber <= graceEnd) {
+                throw new Revert('Domain is not available');
+            }
+            this.domainPendingOwner.set(domainKey, u256.Zero);
+            this.domainPendingTimestamp.set(domainKey, u256.Zero);
+        }
+
+        // Calculate MOTO price
+        const totalMotoPrice = this.calculateMotoRegistrationPrice(domainName, domainKey, blockNumber, years);
+        this.collectMotoPayment(totalMotoPrice);
 
         // Register domain
-        const blockNumber = Blockchain.block.number;
         const sender = Blockchain.tx.sender;
+        const expiryBlock = SafeMath.add64(blockNumber, SafeMath.mul64(BLOCKS_PER_YEAR, years));
 
         this.domainExists.set(domainKey, u256.One);
         this.domainOwner.set(domainKey, this._addressToU256(sender));
         this.domainCreated.set(domainKey, u256.fromU64(blockNumber));
         this.domainTTL.set(domainKey, u256.fromU64(DEFAULT_TTL));
+        this.domainExpiry.set(domainKey, u256.fromU64(expiryBlock));
+
+        // Clear stale auction start so next expiry cycle computes a fresh one
+        this.domainAuctionStart.set(domainKey, u256.Zero);
+
+        // Clear stale contenthash from previous owner
+        this.contenthashType.set(domainKey, u256.Zero);
+        this.contenthashData.set(domainKey, u256.Zero);
 
         this.emitEvent(new DomainRegisteredEvent(domainKey, sender, blockNumber));
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Renew a domain paying with MOTO tokens instead of BTC.
+     */
+    @method(
+        { name: 'domainName', type: ABIDataTypes.STRING },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+    )
+    @emit('DomainRenewed')
+    public renewDomainWithMoto(calldata: Calldata): BytesWriter {
+        this.requireMotoEnabled();
+
+        const domainName = calldata.readStringWithLength();
+        const years = calldata.readU64();
+
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
+        }
+
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        if (this.domainExists.get(domainKey).isZero()) {
+            throw new Revert('Domain does not exist');
+        }
+
+        const owner = this._u256ToAddress(this.domainOwner.get(domainKey));
+        if (!Blockchain.tx.sender.equals(owner)) {
+            throw new Revert('Not domain owner');
+        }
+
+        const currentExpiry = this.domainExpiry.get(domainKey).toU64();
+        const graceEnd = SafeMath.add64(currentExpiry, GRACE_PERIOD_BLOCKS);
+        if (blockNumber > graceEnd) {
+            throw new Revert('Domain expired past grace period');
+        }
+
+        // MOTO renewal: base price * years
+        const motoBase = this.motoBasePrice.get(u256.Zero);
+        if (motoBase.isZero()) {
+            throw new Revert('MOTO base price not set');
+        }
+        const totalMotoPrice = SafeMath.mul(motoBase, u256.fromU64(years));
+        this.collectMotoPayment(totalMotoPrice);
+
+        const extensionBase = blockNumber > currentExpiry ? blockNumber : currentExpiry;
+        const newExpiry = SafeMath.add64(extensionBase, SafeMath.mul64(BLOCKS_PER_YEAR, years));
+        this.domainExpiry.set(domainKey, u256.fromU64(newExpiry));
+
+        this.emitEvent(new DomainRenewedEvent(domainKey, owner, newExpiry, blockNumber));
+
+        return new BytesWriter(0);
+    }
+
+    // =========================================================================
+    // DOMAIN REGISTRATION METHODS (Two-Step BTC Flow)
+    // =========================================================================
+
+    /**
+     * Step 1: Reserve a domain name.
+     * Pays a small reservation fee (2k sats) to lock the name for 5 blocks.
+     * EOA only — contracts cannot reserve domains.
+     */
+    @method(
+        { name: 'domainName', type: ABIDataTypes.STRING },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+    )
+    @emit('DomainReserved')
+    public reserveDomain(calldata: Calldata): BytesWriter {
+        this.requireEOA();
+
+        const domainName = calldata.readStringWithLength();
+        const years = calldata.readU64();
+
+        this.validateDomainName(domainName);
+
+        if (domainName == RESERVED_DOMAIN) {
+            throw new Revert('Domain is reserved');
+        }
+
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
+        }
+
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        // Check domain availability: must not exist OR must be fully expired (past grace)
+        const exists = !this.domainExists.get(domainKey).isZero();
+        if (exists) {
+            const expiry = this.domainExpiry.get(domainKey).toU64();
+            const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+            if (blockNumber <= graceEnd) {
+                throw new Revert('Domain is not available');
+            }
+        }
+
+        // Check no active reservation exists (or it expired)
+        const existingReservationBlock = this.domainReservationBlock.get(domainKey).toU64();
+        if (existingReservationBlock > 0) {
+            const reservationExpiry = SafeMath.add64(existingReservationBlock, RESERVATION_TIMEOUT_BLOCKS);
+            if (blockNumber <= reservationExpiry) {
+                throw new Revert('Domain is already reserved');
+            }
+        }
+
+        // Verify reservation fee payment to hardcoded address
+        this.verifyReservationFee();
+
+        // Store reservation
+        const sender = Blockchain.tx.sender;
+        this.domainReservationOwner.set(domainKey, this._addressToU256(sender));
+        this.domainReservationBlock.set(domainKey, u256.fromU64(blockNumber));
+        this.domainReservationYears.set(domainKey, u256.fromU64(years));
+
+        this.emitEvent(new DomainReservedEvent(domainKey, sender, years, blockNumber));
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Step 2: Complete domain registration after reservation.
+     * Must be called by the reserver, at least 1 block after reservation, within 5 blocks.
+     * Pays full domain price minus the 2k sat reservation fee.
+     * EOA only — contracts cannot complete registrations.
+     */
+    @method({ name: 'domainName', type: ABIDataTypes.STRING })
+    @emit('DomainRegistered')
+    public completeRegistration(calldata: Calldata): BytesWriter {
+        this.requireEOA();
+
+        const domainName = calldata.readStringWithLength();
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        // Verify reservation exists and is valid
+        const reservationBlock = this.domainReservationBlock.get(domainKey).toU64();
+        if (reservationBlock == 0) {
+            throw new Revert('No reservation found');
+        }
+
+        // Must be at least 1 block after reservation
+        if (blockNumber <= reservationBlock) {
+            throw new Revert('Must wait at least 1 block');
+        }
+
+        // Must be within timeout
+        const reservationExpiry = SafeMath.add64(reservationBlock, RESERVATION_TIMEOUT_BLOCKS);
+        if (blockNumber > reservationExpiry) {
+            throw new Revert('Reservation expired');
+        }
+
+        // Must be the reserver
+        const reserver = this._u256ToAddress(this.domainReservationOwner.get(domainKey));
+        if (!Blockchain.tx.sender.equals(reserver)) {
+            throw new Revert('Not reservation owner');
+        }
+
+        const years = this.domainReservationYears.get(domainKey).toU64();
+
+        // Re-verify domain availability (could have changed via upgrade, etc.)
+        const exists = !this.domainExists.get(domainKey).isZero();
+        if (exists) {
+            const expiry = this.domainExpiry.get(domainKey).toU64();
+            const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+            if (blockNumber <= graceEnd) {
+                throw new Revert('Domain is not available');
+            }
+            this.domainPendingOwner.set(domainKey, u256.Zero);
+            this.domainPendingTimestamp.set(domainKey, u256.Zero);
+        }
+
+        // Calculate price and deduct reservation fee
+        const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
+        const auctionPrice = this.calculateAuctionPrice(domainName, domainKey, blockNumber);
+        const totalPrice = SafeMath.add64(
+            auctionPrice,
+            SafeMath.mul64(basePrice, years - 1),
+        );
+        const remainingPrice = totalPrice > RESERVATION_FEE_SATS
+            ? SafeMath.sub64(totalPrice, RESERVATION_FEE_SATS)
+            : <u64>0;
+
+        if (remainingPrice > 0) {
+            this.verifyPayment(remainingPrice);
+        }
+
+        // Register domain
+        const sender = Blockchain.tx.sender;
+        const expiryBlock = SafeMath.add64(blockNumber, SafeMath.mul64(BLOCKS_PER_YEAR, years));
+
+        this.domainExists.set(domainKey, u256.One);
+        this.domainOwner.set(domainKey, this._addressToU256(sender));
+        this.domainCreated.set(domainKey, u256.fromU64(blockNumber));
+        this.domainTTL.set(domainKey, u256.fromU64(DEFAULT_TTL));
+        this.domainExpiry.set(domainKey, u256.fromU64(expiryBlock));
+        this.domainAuctionStart.set(domainKey, u256.Zero);
+
+        // Clear stale contenthash from previous owner
+        this.contenthashType.set(domainKey, u256.Zero);
+        this.contenthashData.set(domainKey, u256.Zero);
+
+        // Clear reservation
+        this.domainReservationOwner.set(domainKey, u256.Zero);
+        this.domainReservationBlock.set(domainKey, u256.Zero);
+        this.domainReservationYears.set(domainKey, u256.Zero);
+
+        this.emitEvent(new DomainRegisteredEvent(domainKey, sender, blockNumber));
+
+        return new BytesWriter(0);
+    }
+
+    /**
+     * Renew an existing domain subscription.
+     * Can be called by the domain owner during active period or grace period.
+     * Always charges base price per year (no premium surcharge on renewals).
+     * @param calldata Contains domain name and years to extend (1-10)
+     */
+    @method(
+        { name: 'domainName', type: ABIDataTypes.STRING },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+    )
+    @emit('DomainRenewed')
+    public renewDomain(calldata: Calldata): BytesWriter {
+        const domainName = calldata.readStringWithLength();
+        const years = calldata.readU64();
+
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
+        }
+
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        // Domain must exist
+        if (this.domainExists.get(domainKey).isZero()) {
+            throw new Revert('Domain does not exist');
+        }
+
+        // Must be the domain owner
+        const owner = this._u256ToAddress(this.domainOwner.get(domainKey));
+        if (!Blockchain.tx.sender.equals(owner)) {
+            throw new Revert('Not domain owner');
+        }
+
+        // Must be within active period or grace period (not fully expired)
+        const currentExpiry = this.domainExpiry.get(domainKey).toU64();
+        const graceEnd = SafeMath.add64(currentExpiry, GRACE_PERIOD_BLOCKS);
+        if (blockNumber > graceEnd) {
+            throw new Revert('Domain expired past grace period');
+        }
+
+        // Calculate payment: base price * years (no premium on renewals)
+        const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
+        const totalPrice = SafeMath.mul64(basePrice, years);
+        this.verifyPayment(totalPrice);
+
+        // Extend expiry from max(currentBlock, currentExpiry)
+        // - Before expiry: extends from current expiry (don't lose remaining time)
+        // - During grace: extends from current block (grace time is lost)
+        const extensionBase = blockNumber > currentExpiry ? blockNumber : currentExpiry;
+        const newExpiry = SafeMath.add64(extensionBase, SafeMath.mul64(BLOCKS_PER_YEAR, years));
+        this.domainExpiry.set(domainKey, u256.fromU64(newExpiry));
+
+        this.emitEvent(new DomainRenewedEvent(domainKey, owner, newExpiry, blockNumber));
 
         return new BytesWriter(0);
     }
@@ -308,8 +976,8 @@ export class BtcNameResolver extends OP_NET {
 
         const domainKey = this.getDomainKeyU256(domainName);
 
-        // Verify caller is owner
-        this.requireDomainOwner(domainKey);
+        // Verify caller is owner and domain is fully active (not in grace)
+        this.requireActiveDomainOwner(domainKey);
 
         // Validate new owner
         if (newOwner.equals(Address.zero())) {
@@ -341,6 +1009,17 @@ export class BtcNameResolver extends OP_NET {
     public acceptTransfer(calldata: Calldata): BytesWriter {
         const domainName = calldata.readStringWithLength();
         const domainKey = this.getDomainKeyU256(domainName);
+
+        // Verify domain exists
+        if (this.domainExists.get(domainKey).isZero()) {
+            throw new Revert('Domain does not exist');
+        }
+
+        // Verify domain is fully active (not in grace — transfers only on active domains)
+        const expiry = this.domainExpiry.get(domainKey).toU64();
+        if (Blockchain.block.number > expiry) {
+            throw new Revert('Domain not active');
+        }
 
         // Verify pending transfer exists
         const pendingOwner = this._u256ToAddress(this.domainPendingOwner.get(domainKey));
@@ -415,8 +1094,8 @@ export class BtcNameResolver extends OP_NET {
 
         const domainKey = this.getDomainKeyU256(domainName);
 
-        // Verify caller is owner
-        this.requireDomainOwner(domainKey);
+        // Verify caller is owner and domain is fully active (not in grace)
+        this.requireActiveDomainOwner(domainKey);
 
         // Validate new owner
         if (newOwner.equals(Address.zero())) {
@@ -476,8 +1155,8 @@ export class BtcNameResolver extends OP_NET {
         const deadline = calldata.readU64();
         const signature = calldata.readBytesWithLength();
 
-        // Check signature length (Schnorr = 64 bytes)
-        if (signature.length !== 64) {
+        // Accept both Schnorr (64 bytes) and ML-DSA signatures
+        if (signature.length < 64) {
             throw new Revert('Invalid signature length');
         }
 
@@ -491,6 +1170,12 @@ export class BtcNameResolver extends OP_NET {
         // Verify domain exists
         if (this.domainExists.get(domainKey).isZero()) {
             throw new Revert('Domain does not exist');
+        }
+
+        // Verify domain is fully active (not in grace period — no transfers on expiring domains)
+        const expiry = this.domainExpiry.get(domainKey).toU64();
+        if (Blockchain.block.number > expiry) {
+            throw new Revert('Domain not active');
         }
 
         // Verify the provided owner address matches the domain owner
@@ -508,14 +1193,19 @@ export class BtcNameResolver extends OP_NET {
             throw new Revert('Cannot transfer to self');
         }
 
+        // Get current nonce for replay protection
+        const nonce = this.domainNonce.get(domainKey);
+
         // Build message hash for signature verification
-        // Structure: sha256(domainKey + newOwner + deadline)
+        // Structure: sha256(contractAddress + domainKey + newOwner + deadline + nonce)
         const messageData = new BytesWriter(
-            U256_BYTE_LENGTH + ADDRESS_BYTE_LENGTH + U64_BYTE_LENGTH,
+            ADDRESS_BYTE_LENGTH + U256_BYTE_LENGTH + ADDRESS_BYTE_LENGTH + U64_BYTE_LENGTH + U256_BYTE_LENGTH,
         );
+        messageData.writeAddress(Blockchain.contractAddress);
         messageData.writeU256(domainKey);
         messageData.writeAddress(newOwner);
         messageData.writeU64(deadline);
+        messageData.writeU256(nonce);
 
         const messageHash = Blockchain.sha256(messageData.getBuffer());
 
@@ -523,6 +1213,9 @@ export class BtcNameResolver extends OP_NET {
         if (!Blockchain.verifySignature(owner, signature, messageHash)) {
             throw new Revert('Invalid signature');
         }
+
+        // Increment nonce to prevent replay
+        this.domainNonce.set(domainKey, SafeMath.add(nonce, u256.One));
 
         const blockNumber = Blockchain.block.number;
 
@@ -846,31 +1539,44 @@ export class BtcNameResolver extends OP_NET {
     // =========================================================================
 
     /**
-     * Get domain information.
+     * Get domain information including subscription status.
      */
     @method({ name: 'domainName', type: ABIDataTypes.STRING })
     @returns(
         { name: 'exists', type: ABIDataTypes.BOOL },
         { name: 'owner', type: ABIDataTypes.ADDRESS },
         { name: 'createdAt', type: ABIDataTypes.UINT64 },
+        { name: 'expiresAt', type: ABIDataTypes.UINT64 },
         { name: 'ttl', type: ABIDataTypes.UINT64 },
+        { name: 'isActive', type: ABIDataTypes.BOOL },
+        { name: 'inGracePeriod', type: ABIDataTypes.BOOL },
     )
     public getDomain(calldata: Calldata): BytesWriter {
         const domainName = calldata.readStringWithLength();
         const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
 
         const exists = !this.domainExists.get(domainKey).isZero();
         const owner = exists
             ? this._u256ToAddress(this.domainOwner.get(domainKey))
             : Address.zero();
         const createdAt = exists ? this.domainCreated.get(domainKey).toU64() : <u64>0;
+        const expiresAt = exists ? this.domainExpiry.get(domainKey).toU64() : <u64>0;
         const ttl = exists ? this.domainTTL.get(domainKey).toU64() : <u64>0;
 
-        const response = new BytesWriter(1 + 32 + 8 + 8);
+        // Active = not expired yet
+        const isActive = exists && blockNumber <= expiresAt;
+        // In grace = expired but within grace window
+        const inGracePeriod = exists && !isActive && blockNumber <= SafeMath.add64(expiresAt, GRACE_PERIOD_BLOCKS);
+
+        const response = new BytesWriter(1 + 32 + 8 + 8 + 8 + 1 + 1);
         response.writeBoolean(exists);
         response.writeAddress(owner);
         response.writeU64(createdAt);
+        response.writeU64(expiresAt);
         response.writeU64(ttl);
+        response.writeBoolean(isActive);
+        response.writeBoolean(inGracePeriod);
 
         return response;
     }
@@ -946,25 +1652,43 @@ export class BtcNameResolver extends OP_NET {
     /**
      * Resolve a full name to its owner address.
      * Works for both domains and subdomains.
+     * Returns zero address for expired domains (past grace period).
      */
     @method({ name: 'name', type: ABIDataTypes.STRING })
     @returns({ name: 'owner', type: ABIDataTypes.ADDRESS })
     public resolve(calldata: Calldata): BytesWriter {
         const name = calldata.readStringWithLength();
         const nameKey = this.resolveNameKey(name);
+        const blockNumber = Blockchain.block.number;
 
         let owner: Address;
         if (this.isSubdomain(name)) {
             if (this.subdomainExists.get(nameKey).isZero()) {
                 owner = Address.zero();
             } else {
-                owner = this._u256ToAddress(this.subdomainOwner.get(nameKey));
+                // Check if parent domain is still active
+                const parentName = this.getParentDomain(name);
+                const parentKey = this.getDomainKeyU256(parentName);
+                const parentExpiry = this.domainExpiry.get(parentKey).toU64();
+                const parentGraceEnd = SafeMath.add64(parentExpiry, GRACE_PERIOD_BLOCKS);
+                if (blockNumber > parentGraceEnd) {
+                    owner = Address.zero();
+                } else {
+                    owner = this._u256ToAddress(this.subdomainOwner.get(nameKey));
+                }
             }
         } else {
             if (this.domainExists.get(nameKey).isZero()) {
                 owner = Address.zero();
             } else {
-                owner = this._u256ToAddress(this.domainOwner.get(nameKey));
+                // Check if domain is still within active + grace period
+                const expiry = this.domainExpiry.get(nameKey).toU64();
+                const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+                if (blockNumber > graceEnd) {
+                    owner = Address.zero();
+                } else {
+                    owner = this._u256ToAddress(this.domainOwner.get(nameKey));
+                }
             }
         }
 
@@ -1012,16 +1736,39 @@ export class BtcNameResolver extends OP_NET {
     }
 
     /**
-     * Get current domain price for a specific domain.
+     * Get current domain registration price for a specific domain and year count.
+     * Returns the total cost including Dutch auction premium (if applicable) + base rate for extra years.
      */
-    @method({ name: 'domainName', type: ABIDataTypes.STRING })
-    @returns({ name: 'priceSats', type: ABIDataTypes.UINT64 })
+    @method(
+        { name: 'domainName', type: ABIDataTypes.STRING },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+    )
+    @returns(
+        { name: 'totalPriceSats', type: ABIDataTypes.UINT64 },
+        { name: 'auctionPriceSats', type: ABIDataTypes.UINT64 },
+        { name: 'basePricePerYear', type: ABIDataTypes.UINT64 },
+    )
     public getDomainPrice(calldata: Calldata): BytesWriter {
         const domainName = calldata.readStringWithLength();
-        const price = this.calculateDomainPrice(domainName);
+        const years = calldata.readU64();
 
-        const response = new BytesWriter(8);
-        response.writeU64(price);
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+        const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
+        const auctionPrice = this.calculateAuctionPrice(domainName, domainKey, blockNumber);
+
+        if (years < 1 || years > MAX_REGISTRATION_YEARS) {
+            throw new Revert('Years must be 1-10');
+        }
+        const totalPrice = SafeMath.add64(
+            auctionPrice,
+            SafeMath.mul64(basePrice, years - 1),
+        );
+
+        const response = new BytesWriter(8 + 8 + 8);
+        response.writeU64(totalPrice);
+        response.writeU64(auctionPrice);
+        response.writeU64(basePrice);
 
         return response;
     }
@@ -1035,6 +1782,48 @@ export class BtcNameResolver extends OP_NET {
         const response = new BytesWriter(8);
         response.writeU64(this.domainPriceSats.get(u256.Zero).toU64());
 
+        return response;
+    }
+
+    /**
+     * Get the current nonce for a domain (used in signature-based transfers).
+     */
+    @method({ name: 'domainName', type: ABIDataTypes.STRING })
+    @returns({ name: 'nonce', type: ABIDataTypes.UINT256 })
+    public getDomainNonce(calldata: Calldata): BytesWriter {
+        const domainName = calldata.readStringWithLength();
+        const domainKey = this.getDomainKeyU256(domainName);
+
+        const response = new BytesWriter(32);
+        response.writeU256(this.domainNonce.get(domainKey));
+        return response;
+    }
+
+    /**
+     * Get reservation info for a domain.
+     */
+    @method({ name: 'domainName', type: ABIDataTypes.STRING })
+    @returns(
+        { name: 'reserver', type: ABIDataTypes.ADDRESS },
+        { name: 'reservedAt', type: ABIDataTypes.UINT64 },
+        { name: 'years', type: ABIDataTypes.UINT64 },
+        { name: 'isActive', type: ABIDataTypes.BOOL },
+    )
+    public getReservation(calldata: Calldata): BytesWriter {
+        const domainName = calldata.readStringWithLength();
+        const domainKey = this.getDomainKeyU256(domainName);
+        const blockNumber = Blockchain.block.number;
+
+        const reserver = this._u256ToAddress(this.domainReservationOwner.get(domainKey));
+        const reservedAt = this.domainReservationBlock.get(domainKey).toU64();
+        const years = this.domainReservationYears.get(domainKey).toU64();
+        const isActive = reservedAt > 0 && blockNumber <= SafeMath.add64(reservedAt, RESERVATION_TIMEOUT_BLOCKS);
+
+        const response = new BytesWriter(32 + 8 + 8 + 1);
+        response.writeAddress(reserver);
+        response.writeU64(reservedAt);
+        response.writeU64(years);
+        response.writeBoolean(isActive);
         return response;
     }
 
@@ -1161,10 +1950,14 @@ export class BtcNameResolver extends OP_NET {
             throw new Revert('Subdomain label must be 1-63 characters');
         }
 
-        // Same rules as domain
         const first = label.charCodeAt(0);
         if (!this.isAlphanumeric(first)) {
             throw new Revert('Subdomain must start with alphanumeric');
+        }
+
+        const last = label.charCodeAt(len - 1);
+        if (!this.isAlphanumeric(last)) {
+            throw new Revert('Subdomain must end with alphanumeric');
         }
 
         for (let i = 0; i < len; i++) {
@@ -1176,6 +1969,13 @@ export class BtcNameResolver extends OP_NET {
 
             if (!isLower && !isUpper && !isDigit && !isHyphen) {
                 throw new Revert('Invalid character in subdomain');
+            }
+        }
+
+        // No consecutive hyphens
+        for (let i = 0; i < len - 1; i++) {
+            if (label.charCodeAt(i) == 45 && label.charCodeAt(i + 1) == 45) {
+                throw new Revert('No consecutive hyphens allowed');
             }
         }
     }
@@ -1236,7 +2036,11 @@ export class BtcNameResolver extends OP_NET {
         }
     }
 
-    private calculateDomainPrice(domainName: string): u64 {
+    /**
+     * Get the static premium tier price for a domain (before Dutch auction decay).
+     * Returns the base price if the domain is not premium.
+     */
+    private getPremiumTierPrice(domainName: string): u64 {
         const lowerName = this.toLowerCase(domainName);
         const len = lowerName.length;
         const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
@@ -1282,11 +2086,11 @@ export class BtcNameResolver extends OP_NET {
         }
 
         if (this.isInPremiumList(lowerName, PREMIUM_TIER_5_DOMAINS)) {
-            return PREMIUM_TIER_4_PRICE_SATS;
+            return PREMIUM_TIER_5_PRICE_SATS;
         }
 
         if (this.isInPremiumList(lowerName, PREMIUM_TIER_6_DOMAINS)) {
-            return PREMIUM_TIER_4_PRICE_SATS;
+            return PREMIUM_TIER_5_PRICE_SATS;
         }
 
         if (len == 5) {
@@ -1294,6 +2098,85 @@ export class BtcNameResolver extends OP_NET {
         }
 
         return basePrice;
+    }
+
+    /**
+     * Calculate the current Dutch auction price for a domain.
+     * Premium domains start at tier price and linearly decay to base price over AUCTION_DURATION_BLOCKS.
+     * Non-premium domains always return the base price.
+     *
+     * Auction start is determined by:
+     * - For never-registered domains: contract deployment block
+     * - For expired domains (re-registration): expiry + GRACE_PERIOD (when domain became public)
+     */
+    private calculateAuctionPrice(domainName: string, domainKey: u256, currentBlock: u64): u64 {
+        const basePrice = this.domainPriceSats.get(u256.Zero).toU64();
+        const premiumPrice = this.getPremiumTierPrice(domainName);
+
+        // Non-premium domains: no auction, just base price
+        if (premiumPrice <= basePrice) {
+            return basePrice;
+        }
+
+        // Auction floor is the immutable default price, not the mutable base price.
+        // This prevents the deployer from manipulating active auctions.
+        const auctionFloor: u64 = DEFAULT_DOMAIN_PRICE_SATS;
+
+        // Determine auction start block
+        const auctionStart = this.getAuctionStart(domainKey);
+
+        // If current block is before auction start (shouldn't happen normally), use full premium
+        if (currentBlock <= auctionStart) {
+            return premiumPrice;
+        }
+
+        // Calculate linear decay: price decreases from premiumPrice to auctionFloor
+        const elapsed = currentBlock - auctionStart;
+
+        // If past auction duration, price has decayed to floor
+        if (elapsed >= AUCTION_DURATION_BLOCKS) {
+            return auctionFloor;
+        }
+
+        // Linear interpolation: price = premiumPrice - (elapsed * (premiumPrice - auctionFloor)) / AUCTION_DURATION_BLOCKS
+        const priceDelta = premiumPrice - auctionFloor;
+        const decay = SafeMath.div64(SafeMath.mul64(elapsed, priceDelta), AUCTION_DURATION_BLOCKS);
+
+        return premiumPrice - decay;
+    }
+
+    /**
+     * Extract the parent domain name from a subdomain (e.g., "sub.example" -> "example").
+     */
+    private getParentDomain(fullName: string): string {
+        for (let i: i32 = 0; i < fullName.length; i++) {
+            if (fullName.charCodeAt(i) == 46) {
+                // '.'
+                return fullName.substring(i + 1);
+            }
+        }
+        return fullName;
+    }
+
+    /**
+     * Get the auction start block for a domain (read-only, no storage writes).
+     * - If domainAuctionStart is set: use it
+     * - If domain existed before: expiry + grace period
+     * - Otherwise: deployment block
+     */
+    private getAuctionStart(domainKey: u256): u64 {
+        const storedAuctionStart = this.domainAuctionStart.get(domainKey).toU64();
+        if (storedAuctionStart > 0) {
+            return storedAuctionStart;
+        }
+
+        const existsVal = this.domainExists.get(domainKey);
+        if (!existsVal.isZero()) {
+            const expiry = this.domainExpiry.get(domainKey).toU64();
+            return SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+        }
+
+        return this.deploymentBlock.get(u256.Zero).toU64();
     }
 
     private isInPremiumList(domainName: string, premiumList: string[]): boolean {
@@ -1330,6 +2213,33 @@ export class BtcNameResolver extends OP_NET {
             throw new Revert('Domain does not exist');
         }
 
+        // Check that domain is still active (not expired past grace period)
+        const expiry = this.domainExpiry.get(domainKey).toU64();
+        const graceEnd = SafeMath.add64(expiry, GRACE_PERIOD_BLOCKS);
+        if (Blockchain.block.number > graceEnd) {
+            throw new Revert('Domain expired');
+        }
+
+        const owner = this._u256ToAddress(this.domainOwner.get(domainKey));
+        if (!Blockchain.tx.sender.equals(owner)) {
+            throw new Revert('Not domain owner');
+        }
+    }
+
+    /**
+     * Stricter ownership check: domain must be fully active (not in grace period).
+     * Used for transfers to prevent moving expired domains at base renewal cost.
+     */
+    private requireActiveDomainOwner(domainKey: u256): void {
+        if (this.domainExists.get(domainKey).isZero()) {
+            throw new Revert('Domain does not exist');
+        }
+
+        const expiry = this.domainExpiry.get(domainKey).toU64();
+        if (Blockchain.block.number > expiry) {
+            throw new Revert('Domain not active');
+        }
+
         const owner = this._u256ToAddress(this.domainOwner.get(domainKey));
         if (!Blockchain.tx.sender.equals(owner)) {
             throw new Revert('Not domain owner');
@@ -1341,6 +2251,14 @@ export class BtcNameResolver extends OP_NET {
             if (this.subdomainExists.get(nameKey).isZero()) {
                 throw new Revert('Subdomain does not exist');
             }
+            // Check parent domain is still active
+            const parentName = this.getParentDomain(name);
+            const parentKey = this.getDomainKeyU256(parentName);
+            const parentExpiry = this.domainExpiry.get(parentKey).toU64();
+            const parentGraceEnd = SafeMath.add64(parentExpiry, GRACE_PERIOD_BLOCKS);
+            if (Blockchain.block.number > parentGraceEnd) {
+                throw new Revert('Parent domain expired');
+            }
             const owner = this._u256ToAddress(this.subdomainOwner.get(nameKey));
             if (!Blockchain.tx.sender.equals(owner)) {
                 throw new Revert('Not subdomain owner');
@@ -1348,5 +2266,156 @@ export class BtcNameResolver extends OP_NET {
         } else {
             this.requireDomainOwner(nameKey);
         }
+    }
+
+    private requireEOA(): void {
+        if (!Blockchain.tx.origin.equals(Blockchain.tx.sender)) {
+            throw new Revert('Contracts not allowed');
+        }
+        if (Blockchain.isContract(Blockchain.tx.sender)) {
+            throw new Revert('Sender must be EOA');
+        }
+    }
+
+    private verifyReservationFee(): void {
+        let totalPaid: u64 = 0;
+
+        const outputs = Blockchain.tx.outputs;
+        for (let i: i32 = 0; i < outputs.length; i++) {
+            if (outputs[i].to == RESERVATION_FEE_ADDRESS) {
+                totalPaid = SafeMath.add64(totalPaid, outputs[i].value);
+            }
+        }
+
+        if (totalPaid < RESERVATION_FEE_SATS) {
+            throw new Revert('Insufficient reservation fee');
+        }
+    }
+
+    private requireMotoEnabled(): void {
+        if (this.motoEnabled.get(u256.Zero).isZero()) {
+            throw new Revert('MOTO payments are disabled');
+        }
+    }
+
+    // =========================================================================
+    // MOTO PAYMENT HELPERS
+    // =========================================================================
+
+    /**
+     * Get the premium tier index for a domain (0-5), or 255 for non-premium.
+     */
+    private getDomainTierIndex(domainName: string): u8 {
+        const lowerName = this.toLowerCase(domainName);
+        const len = lowerName.length;
+
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_0_DOMAINS)) return 0;
+        if (len == 1) return 1;
+        if (len == 2) return 2;
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_1_DOMAINS)) return 1;
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_2_DOMAINS)) return 2;
+        if (len == 3) return 3;
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_3_DOMAINS)) return 3;
+        if (len == 4) return 4;
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_4_DOMAINS)) return 4;
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_5_DOMAINS)) return 5;
+        if (this.isInPremiumList(lowerName, PREMIUM_TIER_6_DOMAINS)) return 5;
+        if (len == 5) return 5;
+
+        return 255;
+    }
+
+    /**
+     * Calculate total MOTO cost for domain registration.
+     * Premium tier MOTO price (with Dutch auction decay) + base MOTO price for extra years.
+     */
+    private calculateMotoRegistrationPrice(
+        domainName: string,
+        domainKey: u256,
+        currentBlock: u64,
+        years: u64,
+    ): u256 {
+        const motoBase = this.motoBasePrice.get(u256.Zero);
+        if (motoBase.isZero()) {
+            throw new Revert('MOTO base price not set');
+        }
+
+        const tierIndex = this.getDomainTierIndex(domainName);
+
+        // Non-premium: just base * years
+        if (tierIndex == 255) {
+            return SafeMath.mul(motoBase, u256.fromU64(years));
+        }
+
+        // Premium: get MOTO tier price and apply Dutch auction decay
+        const motoTierPrice = this.motoTierPrices.get(u256.fromU32(<u32>tierIndex));
+        if (motoTierPrice.isZero()) {
+            throw new Revert('MOTO tier price not set');
+        }
+
+        // Dutch auction on MOTO price: decay from motoTierPrice to motoBase
+        const auctionPrice = this.calculateMotoAuctionPrice(
+            motoTierPrice,
+            motoBase,
+            domainKey,
+            currentBlock,
+        );
+
+        // Auction covers first year, base for remaining
+        if (years <= 1) {
+            return auctionPrice;
+        }
+
+        return SafeMath.add(auctionPrice, SafeMath.mul(motoBase, u256.fromU64(years - 1)));
+    }
+
+    /**
+     * Dutch auction decay for MOTO prices: linearly decays from tierPrice to basePrice.
+     */
+    private calculateMotoAuctionPrice(
+        tierPrice: u256,
+        basePrice: u256,
+        domainKey: u256,
+        currentBlock: u64,
+    ): u256 {
+        if (tierPrice <= basePrice) {
+            return basePrice;
+        }
+
+        const auctionStart = this.getAuctionStart(domainKey);
+
+        if (currentBlock <= auctionStart) {
+            return tierPrice;
+        }
+
+        const elapsed = currentBlock - auctionStart;
+        if (elapsed >= AUCTION_DURATION_BLOCKS) {
+            return basePrice;
+        }
+
+        const priceDelta = SafeMath.sub(tierPrice, basePrice);
+        const decay = SafeMath.div(
+            SafeMath.mul(priceDelta, u256.fromU64(elapsed)),
+            u256.fromU64(AUCTION_DURATION_BLOCKS),
+        );
+
+        return SafeMath.sub(tierPrice, decay);
+    }
+
+    /**
+     * Collect MOTO payment from sender via transferFrom.
+     */
+    private collectMotoPayment(amount: u256): void {
+        const motoAddr = this._u256ToAddress(this.motoTokenAddress.get(u256.Zero));
+        if (motoAddr.equals(Address.zero())) {
+            throw new Revert('MOTO token address not set');
+        }
+
+        TransferHelper.transferFrom(
+            motoAddr,
+            Blockchain.tx.sender,
+            Blockchain.contractAddress,
+            amount,
+        );
     }
 }

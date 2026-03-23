@@ -55,6 +55,36 @@ export const MIN_TTL: u64 = 60;
 export const MAX_TTL: u64 = 604800;
 
 // =============================================================================
+// Subscription & Auction Constants
+// =============================================================================
+
+/** Approximate blocks per year on Bitcoin (~144 blocks/day * 365 days) */
+export const BLOCKS_PER_YEAR: u64 = 52_560;
+
+/** Grace period after domain expiry: owner can still renew during this window */
+export const GRACE_PERIOD_BLOCKS: u64 = 500;
+
+/** Duration of Dutch auction decay in blocks (~6 months). Premium price decays to base price over this period. */
+export const AUCTION_DURATION_BLOCKS: u64 = 26_280;
+
+/** Maximum number of years that can be registered/renewed at once */
+export const MAX_REGISTRATION_YEARS: u64 = 10;
+
+// =============================================================================
+// Reservation Constants
+// =============================================================================
+
+/** Reservation fee in satoshis (deducted from final domain price) */
+export const RESERVATION_FEE_SATS: u64 = 2_000;
+
+/** Blocks before an uncompleted reservation expires */
+export const RESERVATION_TIMEOUT_BLOCKS: u64 = 5;
+
+/** Hardcoded Bitcoin address for reservation fees */
+// TODO: Replace with actual address before deployment
+export const RESERVATION_FEE_ADDRESS: string = 'bc1p_REPLACE_ME_WITH_ACTUAL_ADDRESS';
+
+// =============================================================================
 // Pricing Tiers (in satoshis) - 1 BTC = 100,000,000 sats
 // =============================================================================
 
@@ -240,7 +270,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'phemex',
     'mexc',
     'htx',
-    'crypto',
     'cryptocom',
     'upbit',
     'bithumb',
@@ -263,7 +292,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'schwab',
     'vanguard',
     'dex',
-    'cex',
     'swap',
     'swaps',
     'uniswap',
@@ -357,7 +385,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'boss',
     'bosses',
     'legend',
-    'legends',
     'legendary',
     'goat',
     'greatest',
@@ -411,8 +438,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'ngmi',
     'fomo',
     'fud',
-    'hodl',
-    'diamond',
     'diamondhands',
     'paperhands',
     'whale',
@@ -438,7 +463,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'openai',
     'anthropic',
     'claude',
-    'gemini',
     'bard',
     'google',
     'alphabet',
@@ -606,7 +630,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'cryptopunks',
     'bayc',
     'bored',
-    'ape',
     'mayc',
     'azuki',
     'doodles',
@@ -633,7 +656,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'internet',
     'web',
     'online',
-    'digital',
     'virtual',
     'cyber',
     'tech',
@@ -667,7 +689,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'market',
     'marketplace',
     'news',
-    'media',
     'blog',
     'forum',
     'community',
@@ -712,7 +733,6 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'infinity',
     'infinite',
     'future',
-    'futures',
     'next',
     'new',
     'now',
@@ -726,18 +746,13 @@ export const PREMIUM_TIER_0_DOMAINS: string[] = [
     'strength',
     'speed',
     'fast',
-    'smart',
-    'genius',
     'brilliant',
     'amazing',
     'awesome',
     'incredible',
-    'epic',
     'success',
     'successful',
     'win',
-    'winner',
-    'winners',
     'victory',
     'winning',
     'free',
